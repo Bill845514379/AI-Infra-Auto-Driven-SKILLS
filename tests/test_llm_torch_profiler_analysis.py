@@ -3,6 +3,7 @@ from __future__ import annotations
 import contextlib
 import importlib.util
 import io
+import json
 import sys
 import tempfile
 import unittest
@@ -462,6 +463,37 @@ class LlmTorchProfilerAnalysisTest(unittest.TestCase):
         self.assertFalse(
             self.mod.kernel_helpers.pattern_supports_framework(spec, "tokenspeed")
         )
+
+
+class HostDeviceOverlapTest(unittest.TestCase):
+    def load_hdo(self):
+        script = SCRIPT_DIR / "host_device_overlap.py"
+        spec = importlib.util.spec_from_file_location("host_device_overlap", script)
+        assert spec and spec.loader
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    def test_reports_exposed_host_ops_only_when_device_idle(self) -> None:
+        hdo = self.load_hdo()
+        events = [
+            {"ph": "X", "name": "Computing", "cat": "", "ts": 0, "dur": 100},
+            # runs while device busy -> must NOT be listed as exposed
+            {"ph": "X", "name": "aten::relu", "cat": "cpu_op", "ts": 50, "dur": 10},
+            # runs while device idle -> exposed host bottleneck
+            {"ph": "X", "name": "aten::item", "cat": "cpu_op", "ts": 200, "dur": 50},
+        ]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            trace = Path(tmpdir) / "trace_view.json"
+            trace.write_text(json.dumps(events))
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                hdo.main(str(trace))
+            out = buf.getvalue()
+        self.assertIn("设备忙碌", out)
+        self.assertIn("1 个算子", out)  # exactly one exposed host op
+        self.assertIn("aten::item", out)
+        self.assertNotIn("aten::relu", out)
 
 
 if __name__ == "__main__":

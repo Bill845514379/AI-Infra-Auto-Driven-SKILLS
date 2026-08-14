@@ -1,6 +1,6 @@
 ---
 name: llm-torch-profiler-analysis
-description: "Unified LLM torch-profiler triage skill for `sglang`, `vllm`, `TensorRT-LLM`, and `TokenSpeed`. Use it to inspect an existing `trace.json(.gz)` or profile directory, or to drive live profiling against a running server when supported and return one three-table report with kernel, overlap-opportunity, and fuse-pattern tables."
+description: "Unified LLM torch-profiler triage skill for `sglang`, `vllm`, `TensorRT-LLM`, `TokenSpeed`, and Ascend. Use it to inspect an existing `trace.json(.gz)` or profile directory, or to drive live profiling against a running server when supported and return one three-table report with kernel, overlap-opportunity, and fuse-pattern tables. For Ascend `ASCEND_PROFILER_OUTPUT/trace_view.json`, run `host_device_overlap.py` to judge host-bound vs device-bound and list the exposed host bottleneck ops."
 ---
 
 # Unified LLM Torch Profiler Analysis
@@ -13,6 +13,7 @@ Use this skill for `torch.profiler` analysis across:
 - `vllm`
 - `TensorRT-LLM`
 - `TokenSpeed`
+- `Ascend` (NPU, via the `host_device_overlap.py` helper)
 
 There is only one public workflow:
 
@@ -29,6 +30,10 @@ Backwards-compatibility shim (kept so older `docker exec ... analyze_sglang_torc
 Markdown bundling helper:
 
 - [scripts/render_triage_markdown_bundle.py](scripts/render_triage_markdown_bundle.py)
+
+Ascend host/device overlap helper (uses `ASCEND_PROFILER_OUTPUT/trace_view.json`):
+
+- [scripts/host_device_overlap.py](scripts/host_device_overlap.py)
 
 `triage` always prints the same three tables:
 
@@ -184,7 +189,7 @@ H100 notes:
 ## When To Use It
 
 - inspect a `torch.profiler` trace or profile directory from `sglang`, `vllm`,
-  `TensorRT-LLM`, or `TokenSpeed`
+  `TensorRT-LLM`, `TokenSpeed`, or `Ascend`
 - profile a live serving endpoint and analyze the result
 - summarize which kernel families dominate prefill or decode
 - map kernels back to Python code paths
@@ -482,6 +487,41 @@ directories with `--mapping-input` and `--formal-input`.
 If none is conclusive, the analyzer now stops and asks for an explicit
 `sglang`, `vllm`, `trtllm`, or `tokenspeed` value; never interpret an unknown
 trace as SGLang by default.
+
+### 8. Ascend host/device overlap (host bound vs device bound)
+
+For Ascend (NPU) inference profiling, the unified `analyze_llm_torch_profile.py`
+triage does not apply. Use the standalone helper instead:
+
+- [scripts/host_device_overlap.py](scripts/host_device_overlap.py)
+
+It reads the Ascend profiler's `ASCEND_PROFILER_OUTPUT/trace_view.json` and answers
+one question: when the device is idle, is the CPU busy?
+
+- device idle && CPU busy -> `host bound` (CPU cannot feed the device fast enough)
+- device busy            -> `device bound` (device execution is the bottleneck)
+
+Run it on the profile directory produced by Ascend `torch.npu.profiler`:
+
+```bash
+python3 scripts/host_device_overlap.py \
+  <rank>/ASCEND_PROFILER_OUTPUT/trace_view.json
+```
+
+Output includes:
+
+- device span and device-busy percentage (`>=90%` is device bound)
+- total host (`cpu_op`) op time
+- host ops that started while the device was idle, plus the Top-10 exposed host
+  bottleneck ops (aggregated by op name)
+
+Rules of thumb when reporting:
+
+- device busy `< 90%` means host is likely the bottleneck; the Top-10 exposed
+  ops are the concrete CPU work to attack (e.g. `aten::item`,
+  `aten::_local_scalar_dense`, `aten::repeat_interleave`, sync collectives).
+- `host(cpu_op) 算子总耗时` is nested time and can exceed the device span; read
+  it only for magnitude, not as a wall-clock bound.
 
 ## `profile_by_stage`
 
